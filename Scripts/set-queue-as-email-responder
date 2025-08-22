@@ -1,1 +1,132 @@
+var replySender = window.replySender || {};
 
+(function () {
+  "use strict";
+
+  this.applyQueueFromParent = async function (executionContext) {
+    const fc = executionContext.getFormContext();
+    const formType = fc.ui.getFormType();
+    if (formType !== 1 && formType !== 2) return;
+
+    const parent = fc.getAttribute("parentactivityid")?.getValue();
+    const parentId = _cleanGuid(parent?.[0]?.id);
+    if (!_isGuid(parentId)) return;
+
+    try {
+      // ✅ FIX: no guid'...'
+      let rs = await Xrm.WebApi.retrieveMultipleRecords(
+        "queueitem",
+        `?$select=_queueid_value
+          &$filter=_objectid_value eq ${parentId} and statecode eq 0
+          &$orderby=modifiedon desc
+          &$top=1`
+      );
+
+      if (!rs?.entities?.length) {
+        rs = await Xrm.WebApi.retrieveMultipleRecords(
+          "queueitem",
+          `?$select=_queueid_value
+            &$filter=_objectid_value eq ${parentId}
+            &$orderby=modifiedon desc
+            &$top=1`
+        );
+      }
+
+      if (rs?.entities?.length) {
+        const e = rs.entities[0];
+        const queueId = _cleanGuid(e["_queueid_value"]);
+        if (_isGuid(queueId)) {
+          const queueType =
+            e["_queueid_value@Microsoft.Dynamics.CRM.lookuplogicalname"] || "queue";
+          let queueName = e["_queueid_value@OData.Community.Display.V1.FormattedValue"];
+
+          if (!queueName) {
+            try {
+              const qrec = await Xrm.WebApi.retrieveRecord("queue", queueId, "?$select=name");
+              queueName = qrec?.name || "Queue";
+            } catch (_) {
+              queueName = "Queue";
+            }
+          }
+
+          const party = [{ id: queueId, entityType: queueType, name: queueName }];
+
+          const fromAttr = fc.getAttribute("from");
+          fromAttr?.setValue(null);
+          fromAttr?.setValue(party);
+          fromAttr?.setSubmitMode?.("always");
+
+          // remove queue if it slipped into To
+          const toAttr = fc.getAttribute("to");
+          if (toAttr) {
+            const cur = toAttr.getValue() || [];
+            const cleaned = cur.filter(p => _cleanGuid(p?.id) !== queueId);
+            if (cleaned.length !== cur.length) {
+              toAttr.setValue(cleaned);
+              toAttr.setSubmitMode?.("always");
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("Queue lookup failed:", e);
+    } finally {
+      // Always try to append the ticketnumber even if queue lookup failed
+      try { await _appendTicketNumberIfMissing(fc, parentId); } catch (_) {}
+    }
+  };
+
+  async function _appendTicketNumberIfMissing(fc, parentEmailId) {
+    const subjAttr = fc.getAttribute("subject");
+    if (!subjAttr) return;
+    let subject = subjAttr.getValue() || "";
+
+    let ticket = null;
+
+    // Try current email's regarding first
+    const reg = fc.getAttribute("regardingobjectid")?.getValue();
+    if (reg?.[0]?.entityType === "incident") {
+      const caseId = _cleanGuid(reg[0].id);
+      if (_isGuid(caseId)) {
+        const inc = await Xrm.WebApi.retrieveRecord("incident", caseId, "?$select=ticketnumber");
+        ticket = inc?.ticketnumber || null;
+      }
+    }
+
+    // Fall back to parent email’s regarding
+    if (!ticket && _isGuid(parentEmailId)) {
+      try {
+        const pre = await Xrm.WebApi.retrieveRecord(
+          "email",
+          parentEmailId,
+          "?$select=_regardingobjectid_value,_regardingobjectid_value@Microsoft.Dynamics.CRM.lookuplogicalname" +
+          "&$expand=regardingobjectid_incident($select=ticketnumber)"
+        );
+
+        ticket = pre?.regardingobjectid_incident?.ticketnumber || null;
+
+        if (
+          !ticket &&
+          pre?._regardingobjectid_value &&
+          pre["_regardingobjectid_value@Microsoft.Dynamics.CRM.lookuplogicalname"] === "incident"
+        ) {
+          const incId = _cleanGuid(pre._regardingobjectid_value);
+          if (_isGuid(incId)) {
+            const inc2 = await Xrm.WebApi.retrieveRecord("incident", incId, "?$select=ticketnumber");
+            ticket = inc2?.ticketnumber || null;
+          }
+        }
+      } catch (_) {}
+    }
+
+    if (!ticket) return;
+
+    if (!subject.toLowerCase().includes(ticket.toLowerCase())) {
+      subjAttr.setValue(subject ? `${subject} - ${ticket}` : `[Insert Topic] - ${ticket}`);
+      subjAttr.setSubmitMode?.("always");
+    }
+  }
+
+  function _cleanGuid(id) { return (id || "").toString().replace(/{|}/g, "").toLowerCase(); }
+  function _isGuid(id) { return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id || ""); }
+}).call(replySender);
