@@ -1,44 +1,68 @@
+// Web resource: new-email-from-case.js
+// Namespace (no collisions with your other script)
 var sdk = window.sdk || {};
 (function () {
   "use strict";
 
+  // === PUBLIC: OnLoad handler ===
   this.setQueueAsEmailSender = async function (executionContext) {
-    const formContext = executionContext.getFormContext();
-    const formType = formContext.ui.getFormType(); // 1=Create, 2=Update
+    const fc = executionContext.getFormContext();
+    const formType = fc.ui.getFormType(); // 1=Create, 2=Update
     if (formType !== 1 && formType !== 2) return;
 
-    // 1) Set From = Queue (as before)
     try {
-      const queue = await this._getRegardingQueue(formContext);
-      if (queue) {
-        const fromAttr = formContext.getAttribute("from");
-        fromAttr?.setValue(queue);
-        fromAttr?.setSubmitMode?.("always");
+      // Ensure "regarding" is present (launching from Case sometimes delays it)
+      const ok = await _ensureRegardingIncident(fc);
+      if (!ok) return;
+
+      // 1) From = Queue (robust lookup via FetchXML)
+      try {
+        const queueParty = await _getRegardingQueueParty(fc);
+        const fromAttr = fc.getAttribute("from");
+        if (fromAttr && queueParty) {
+          fromAttr.setValue(null);           // clear first to avoid merge quirks
+          fromAttr.setValue(queueParty);     // ActivityParty array
+          fromAttr.setSubmitMode?.("always");
+
+          // Optional: if queue slipped into "to", remove it
+          const toAttr = fc.getAttribute("to");
+          if (toAttr) {
+            const qid = queueParty[0].id?.toLowerCase();
+            const cur = toAttr.getValue() || [];
+            const cleaned = cur.filter(p => (p?.id || "").toLowerCase() !== qid);
+            if (cleaned.length !== cur.length) {
+              toAttr.setValue(cleaned);
+              toAttr.setSubmitMode?.("always");
+            }
+          }
+        }
+      } catch (e) {
+        console.warn("Queue resolution failed:", e);
+      }
+
+      // 2) Subject = Title - TicketNumber (or append if missing)
+      try {
+        await _prefillSubjectFromCase(fc);
+      } catch (e) {
+        console.warn("Subject prefill failed:", e);
       }
     } catch (e) {
-      console.warn("Queue lookup failed:", e);
-    }
-
-    // 2) Subject = Title - TicketNumber (or append " - TicketNumber" if missing)
-    try {
-      await this._prefillSubjectFromCase(formContext);
-    } catch (e) {
-      console.warn("Prefill subject failed:", e);
+      console.error("setQueueAsEmailSender error:", e);
     }
   };
 
-  this._prefillSubjectFromCase = async function (formContext) {
-    const subjAttr = formContext.getAttribute("subject");
+  // === SUBJECT: Title - TicketNumber (append if needed) ===
+  async function _prefillSubjectFromCase(fc) {
+    const subjAttr = fc.getAttribute("subject");
     if (!subjAttr) return;
 
     const existing = (subjAttr.getValue() || "").trim();
+    const reg = fc.getAttribute("regardingobjectid")?.getValue();
+    if (!reg?.[0] || reg[0].entityType !== "incident") return;
 
-    const reg = formContext.getAttribute("regardingobjectid")?.getValue();
-    if (!reg || !reg[0] || reg[0].entityType !== "incident") return;
+    const caseId = _cleanGuid(reg[0].id);
+    if (!_isGuid(caseId)) return;
 
-    const caseId = reg[0].id.replace(/{|}/g, "").toLowerCase();
-
-    // Get Case title + ticketnumber
     const inc = await Xrm.WebApi.retrieveRecord("incident", caseId, "?$select=title,ticketnumber");
     const title = (inc?.title || "").trim();
     const ticket = (inc?.ticketnumber || "").trim();
@@ -47,41 +71,88 @@ var sdk = window.sdk || {};
 
     if (!existing) {
       // Blank subject -> "Title - Ticket"
-      const desired = title && ticket ? `${title} - ${ticket}` : (title || ticket);
+      const desired = (title && ticket) ? `${title} - ${ticket}` : (title || ticket);
       subjAttr.setValue(desired);
       subjAttr.setSubmitMode?.("always");
       return;
     }
 
-    // If there's already a subject, append the ticket only if it's not already present
+    // Already has text -> append " - Ticket" if not already present
     if (ticket && !existing.toLowerCase().includes(ticket.toLowerCase())) {
       subjAttr.setValue(`${existing} - ${ticket}`);
       subjAttr.setSubmitMode?.("always");
     }
-  };
+  }
 
-  this._getRegardingQueue = async function (formContext) {
-    const regardingObject = formContext.getAttribute("regardingobjectid").getValue();
-    if (!regardingObject) return null;
+  // === QUEUE: Resolve From queue from Case via FetchXML ===
+  async function _getRegardingQueueParty(fc) {
+    const reg = fc.getAttribute("regardingobjectid")?.getValue();
+    if (!reg?.[0] || reg[0].entityType !== "incident") return null;
 
-    const regardingObjectId = regardingObject[0].id.replace(/{|}/g, "").toLowerCase();
+    const caseId = _cleanGuid(reg[0].id);
+    if (!_isGuid(caseId)) return null;
 
-    const rs = await Xrm.WebApi.retrieveMultipleRecords(
-      "queueitem",
-      `?$select=_queueid_value,_queueid_value@Microsoft.Dynamics.CRM.lookuplogicalname,_queueid_value@OData.Community.Display.V1.FormattedValue
-        &$filter=_objectid_value eq ${regardingObjectId}
-        &$orderby=modifiedon desc
-        &$top=1`
-    );
+    // Helper to run a fetch and return first queueitem
+    async function findQueueItem(activeOnly) {
+      const stateFilter = activeOnly ? "<condition attribute='statecode' operator='eq' value='0' />" : "";
+      const fetchXml = `
+        <fetch top='1'>
+          <entity name='queueitem'>
+            <attribute name='queueid' />
+            <attribute name='modifiedon' />
+            <filter>
+              <condition attribute='objectid' operator='eq' value='${caseId}' />
+              ${stateFilter}
+            </filter>
+            <order attribute='modifiedon' descending='true' />
+          </entity>
+        </fetch>
+      `;
+      const rs = await Xrm.WebApi.retrieveMultipleRecords(
+        "queueitem",
+        `?fetchXml=${encodeURIComponent(fetchXml)}`
+      );
+      return rs?.entities?.[0] || null;
+    }
 
-    if (!rs.entities.length) return null;
+    // Prefer active queue item; fall back to latest
+    let qi = await findQueueItem(true);
+    if (!qi) qi = await findQueueItem(false);
+    if (!qi) return null;
 
-    const qi = rs.entities[0];
-    return [{
-      id: qi["_queueid_value"],
-      entityType: qi["_queueid_value@Microsoft.Dynamics.CRM.lookuplogicalname"] || "queue",
-      name: qi["_queueid_value@OData.Community.Display.V1.FormattedValue"] || "Queue"
-    }];
-  };
+    const queueId = _cleanGuid(qi["_queueid_value"]);
+    if (!_isGuid(queueId)) return null;
+
+    let queueName = qi["_queueid_value@OData.Community.Display.V1.FormattedValue"];
+    if (!queueName) {
+      try {
+        const qrec = await Xrm.WebApi.retrieveRecord("queue", queueId, "?$select=name");
+        queueName = qrec?.name || "Queue";
+      } catch (_) {
+        queueName = "Queue";
+      }
+    }
+
+    // ActivityParty array for "from"
+    return [{ id: queueId, entityType: "queue", name: queueName }];
+  }
+
+  // === UTIL: Wait briefly for regardingobjectid to be populated ===
+  async function _ensureRegardingIncident(fc) {
+    const MAX_RETRIES = 12;     // ~3s total
+    const DELAY_MS = 250;
+
+    for (let i = 0; i < MAX_RETRIES; i++) {
+      const reg = fc.getAttribute("regardingobjectid")?.getValue();
+      if (reg?.[0]?.entityType === "incident" && _isGuid(_cleanGuid(reg[0].id))) return true;
+      await _sleep(DELAY_MS);
+    }
+    return false;
+  }
+
+  // === Helpers ===
+  function _sleep(ms) { return new Promise(res => setTimeout(res, ms)); }
+  function _cleanGuid(id) { return (id || "").toString().replace(/{|}/g, "").toLowerCase(); }
+  function _isGuid(id) { return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id || ""); }
+
 }).call(sdk);
-
