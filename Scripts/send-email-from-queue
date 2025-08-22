@@ -1,1 +1,87 @@
+var sdk = window.sdk || {};
+(function () {
+  "use strict";
+
+  this.setQueueAsEmailSender = async function (executionContext) {
+    const formContext = executionContext.getFormContext();
+    const formType = formContext.ui.getFormType(); // 1=Create, 2=Update
+    if (formType !== 1 && formType !== 2) return;
+
+    // 1) Set From = Queue (as before)
+    try {
+      const queue = await this._getRegardingQueue(formContext);
+      if (queue) {
+        const fromAttr = formContext.getAttribute("from");
+        fromAttr?.setValue(queue);
+        fromAttr?.setSubmitMode?.("always");
+      }
+    } catch (e) {
+      console.warn("Queue lookup failed:", e);
+    }
+
+    // 2) Subject = Title - TicketNumber (or append " - TicketNumber" if missing)
+    try {
+      await this._prefillSubjectFromCase(formContext);
+    } catch (e) {
+      console.warn("Prefill subject failed:", e);
+    }
+  };
+
+  this._prefillSubjectFromCase = async function (formContext) {
+    const subjAttr = formContext.getAttribute("subject");
+    if (!subjAttr) return;
+
+    const existing = (subjAttr.getValue() || "").trim();
+
+    const reg = formContext.getAttribute("regardingobjectid")?.getValue();
+    if (!reg || !reg[0] || reg[0].entityType !== "incident") return;
+
+    const caseId = reg[0].id.replace(/{|}/g, "").toLowerCase();
+
+    // Get Case title + ticketnumber
+    const inc = await Xrm.WebApi.retrieveRecord("incident", caseId, "?$select=title,ticketnumber");
+    const title = (inc?.title || "").trim();
+    const ticket = (inc?.ticketnumber || "").trim();
+
+    if (!title && !ticket) return;
+
+    if (!existing) {
+      // Blank subject -> "Title - Ticket"
+      const desired = title && ticket ? `${title} - ${ticket}` : (title || ticket);
+      subjAttr.setValue(desired);
+      subjAttr.setSubmitMode?.("always");
+      return;
+    }
+
+    // If there's already a subject, append the ticket only if it's not already present
+    if (ticket && !existing.toLowerCase().includes(ticket.toLowerCase())) {
+      subjAttr.setValue(`${existing} - ${ticket}`);
+      subjAttr.setSubmitMode?.("always");
+    }
+  };
+
+  this._getRegardingQueue = async function (formContext) {
+    const regardingObject = formContext.getAttribute("regardingobjectid").getValue();
+    if (!regardingObject) return null;
+
+    const regardingObjectId = regardingObject[0].id.replace(/{|}/g, "").toLowerCase();
+
+    const rs = await Xrm.WebApi.retrieveMultipleRecords(
+      "queueitem",
+      `?$select=_queueid_value,_queueid_value@Microsoft.Dynamics.CRM.lookuplogicalname,_queueid_value@OData.Community.Display.V1.FormattedValue
+        &$filter=_objectid_value eq ${regardingObjectId}
+        &$orderby=modifiedon desc
+        &$top=1`
+    );
+
+    if (!rs.entities.length) return null;
+
+    const qi = rs.entities[0];
+    return [{
+      id: qi["_queueid_value"],
+      entityType: qi["_queueid_value@Microsoft.Dynamics.CRM.lookuplogicalname"] || "queue",
+      name: qi["_queueid_value@OData.Community.Display.V1.FormattedValue"] || "Queue"
+    }];
+  };
+}).call(sdk);
 
